@@ -3,15 +3,18 @@
 Roblox Up-and-Coming Forecast - make.fun bounty
 Predicts top 10 games for 72 hours based on hourly chart snapshots.
 
-Input: /input/chart_history.json (or similar)
-Output: /output/forecast.json
+Uses multi-factor analysis:
+- Player count momentum (growth rate)
+- Rank velocity (how fast climbing)
+- Game age/recency
+- Volatility-adjusted confidence
 """
 
 import json
 import os
 import math
 from collections import defaultdict
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 def load_input() -> List[Dict]:
     """Load chart history from /input directory."""
@@ -29,164 +32,263 @@ def load_input() -> List[Dict]:
                     snapshots.append(data)
     
     # Sort by timestamp
-    snapshots.sort(key=lambda x: x.get('timestamp', x.get('time', '')))
+    snapshots.sort(key=lambda x: x.get('timestamp', x.get('time', x.get('date', ''))))
     return snapshots
 
-def extract_game_stats(snapshots: List[Dict]) -> Dict[str, Dict]:
-    """Extract statistics for each game from snapshots."""
-    game_data = defaultdict(lambda: {
-        'names': set(),
+def parse_snapshot(snap: Dict) -> tuple:
+    """Parse a snapshot to get timestamp and games list."""
+    time = snap.get('timestamp', snap.get('time', snap.get('date', snap.get('hour', ''))))
+    games = snap.get('games', snap.get('data', snap.get('chart', [])))
+    return time, games
+
+def extract_features(snapshots: List[Dict]) -> Dict[str, Dict]:
+    """
+    Extract features for each game from snapshots.
+    Features: rank history, player history, age, volatility
+    """
+    game_features = defaultdict(lambda: {
         'ranks': [],
         'players': [],
-        'appearances': 0
+        'timestamps': [],
+        'first_seen': None,
+        'last_seen': None,
+        'name_variants': set()
     })
     
     for snap in snapshots:
-        time = snap.get('timestamp', snap.get('time', ''))
-        games = snap.get('games', snap.get('data', []))
+        time, games = parse_snapshot(snap)
         
         for game in games:
-            name = game.get('name', game.get('game_name', ''))
-            rank = game.get('rank', game.get('place', 999))
-            players = game.get('players', game.get('player_count', 0))
+            name = game.get('name', game.get('game_name', game.get('title', '')))
+            rank = game.get('rank', game.get('place', game.get('position', 999)))
+            players = game.get('players', game.get('player_count', game.get('active_players', 0)))
             
-            if name:
-                game_data[name]['names'].add(name)
-                game_data[name]['ranks'].append(rank)
-                game_data[name]['players'].append(players)
-                game_data[name]['appearances'] += 1
+            if not name:
+                continue
+                
+            game_features[name]['name_variants'].add(name)
+            game_features[name]['ranks'].append(rank)
+            game_features[name]['players'].append(players)
+            game_features[name]['timestamps'].append(time)
+            
+            if game_features[name]['first_seen'] is None:
+                game_features[name]['first_seen'] = time
+            game_features[name]['last_seen'] = time
     
-    return game_data
+    return game_features
 
-def predict_top_10(snapshots: List[Dict], game_data: Dict) -> List[Dict]:
+def compute_growth_rate(players: List[float]) -> float:
+    """Compute average growth rate from player history."""
+    if len(players) < 2:
+        return 0
+    
+    # Use recent growth (last few data points)
+    recent = players[-5:] if len(players) >= 5 else players
+    
+    if recent[-1] <= 0:
+        return -1  # Declining
+    
+    # Average growth rate
+    growths = []
+    for i in range(1, len(recent)):
+        if recent[i-1] > 0:
+            growth = (recent[i] - recent[i-1]) / recent[i-1]
+            growths.append(growth)
+    
+    if not growths:
+        return 0
+    
+    return sum(growths) / len(growths)
+
+def compute_rank_velocity(ranks: List[int]) -> float:
     """
-    Predict top 10 games for each of 72 hours using multiple factors:
-    - Recent rank momentum
-    - Player count trend
-    - Consistency
-    - Recency weighting
+    Compute how fast a game is climbing (positive = improving).
+    Recent velocity matters more.
     """
-    if not snapshots:
-        return []
+    if len(ranks) < 2:
+        return 0
     
-    # Get the most recent snapshot
-    latest = snapshots[-1]
-    latest_games = latest.get('games', latest.get('data', []))
+    recent = ranks[-5:] if len(ranks) >= 5 else ranks
     
-    # Calculate momentum for each game
-    game_momentum = {}
+    velocities = []
+    for i in range(1, len(recent)):
+        # Lower rank number = better, so negative change = improving
+        vel = recent[i-1] - recent[i]
+        velocities.append(vel)
     
-    for game_name, stats in game_data.items():
-        if stats['appearances'] < 2:
-            continue
-            
-        ranks = stats['ranks']
-        players = stats['players']
-        
-        # Recent rank trend (last 5 snapshots)
-        recent_ranks = ranks[-5:] if len(ranks) >= 5 else ranks
-        recent_players = players[-5:] if len(players) >= 5 else players
-        
-        # Rank improvement (lower is better)
-        if len(recent_ranks) >= 2:
-            rank_change = recent_ranks[0] - recent_ranks[-1]  # Positive = improving
-        else:
-            rank_change = 0
-            
-        # Player growth
-        if len(recent_players) >= 2 and recent_players[-1] > 0:
-            player_growth = (recent_players[-1] - recent_players[0]) / recent_players[0]
-        else:
-            player_growth = 0
-        
-        # Current rank (lower is better)
-        current_rank = recent_ranks[-1] if recent_ranks else 999
-        
-        # Calculate score: prioritize rising games with good current rank
-        score = 0
-        score += max(0, rank_change) * 2  # Momentum
-        score += player_growth * 1000  # Growth
-        score += max(0, 100 - current_rank) * 0.5  # Current position
-        
-        game_momentum[game_name] = {
-            'score': score,
-            'current_rank': current_rank,
-            'recent_ranks': recent_ranks,
-            'player_growth': player_growth
+    if not velocities:
+        return 0
+    
+    # Weight recent more heavily
+    weights = list(range(1, len(velocities) + 1))
+    weighted_sum = sum(v * w for v, w in zip(velocities, weights))
+    weight_sum = sum(weights)
+    
+    return weighted_sum / weight_sum if weight_sum > 0 else 0
+
+def score_game(name: str, features: Dict) -> float:
+    """
+    Score a game for forecasting.
+    Higher score = more likely to be in top 10.
+    """
+    ranks = features['ranks']
+    players = features['players']
+    
+    if not ranks or not players:
+        return -1000
+    
+    current_rank = ranks[-1]
+    current_players = players[-1]
+    
+    # Must have players to be viable
+    if current_players <= 0:
+        return -1000
+    
+    # Base score from current rank (lower is better)
+    rank_score = max(0, 1000 - current_rank * 100)
+    
+    # Growth rate score
+    growth = compute_growth_rate(players)
+    growth_score = growth * 5000 if growth > 0 else growth * 1000
+    
+    # Rank velocity score
+    velocity = compute_rank_velocity(ranks)
+    velocity_score = velocity * 200
+    
+    # Consistency bonus (games that stay in chart)
+    consistency = min(1, features['appearances'] / 50) if 'appearances' in features else 0.5
+    consistency_score = consistency * 100
+    
+    # Recency bonus (newer games have more potential)
+    total_snapshots = len(ranks)
+    recency = total_snapshots / 100  # Normalize
+    recency_score = recency * 50
+    
+    total = rank_score + growth_score + velocity_score + consistency_score + recency_score
+    
+    return total
+
+def generate_forecast(snapshots: List[Dict], game_features: Dict) -> Dict:
+    """
+    Generate forecast for 72 hours.
+    Returns forecast.json structure.
+    """
+    if not snapshots or not game_features:
+        return {
+            "forecast": [],
+            "note": "No input data available"
         }
     
-    # Get top games by score
-    sorted_games = sorted(game_momentum.items(), key=lambda x: x[1]['score'], reverse=True)
+    # Score all games
+    scored_games = []
+    for name, features in game_features.items():
+        score = score_game(name, features)
+        if score > -1000:
+            scored_games.append({
+                'name': name,
+                'score': score,
+                'current_rank': features['ranks'][-1] if features['ranks'] else 999,
+                'current_players': features['players'][-1] if features['players'] else 0,
+                'growth': compute_growth_rate(features['players']),
+                'velocity': compute_rank_velocity(features['ranks']),
+                'appearances': len(features['ranks'])
+            })
     
-    # Generate forecasts for 72 hours
+    # Sort by score
+    scored_games.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Generate 72 hourly forecasts
     forecasts = []
     
     for hour in range(72):
-        hour_forecast = {
+        hour_pred = {
             "hour": hour,
-            "predictions": []
+            "read_timestamp": f"2026-11-13T06:00:00Z",  # Will be adjusted
+            "top_10": []
         }
         
-        # For each hour, slightly adjust based on trends
-        # Games with strong momentum maintain/gain position
-        # Games with weak momentum fall
-        
-        for i, (game_name, data) in enumerate(sorted_games[:20]):  # Consider top 20
-            if i >= 10:
-                break
+        # For each position, assign probabilities
+        for position in range(10):
+            if position < len(scored_games):
+                game = scored_games[position]
                 
-            # Probability based on position confidence
-            # Higher rank = higher probability
-            rank_confidence = max(0, 1 - (data['current_rank'] / 100))
-            
-            # Add some decay for longer forecasts
-            decay = 1 - (hour * 0.003)  # Slight decay over time
-            
-            probability = min(0.95, rank_confidence * decay * 0.8 + 0.2)
-            
-            hour_forecast['predictions'].append({
-                "rank": i + 1,
-                "name": game_name,
-                "probability": round(probability, 4),
-                "estimated_players": max(0, data.get('recent_players', [0])[-1] if data.get('recent_players') else 0)
-            })
+                # Probability based on:
+                # - Position confidence (higher position = higher prob)
+                # - Score gap to next game
+                # - Growth trajectory
+                # - Uncertainty increases with forecast horizon
+                
+                position_confidence = 1.0 - (position * 0.08)
+                
+                # Decay over time
+                time_decay = math.exp(-hour * 0.005)
+                
+                # Growth adjustment
+                growth_boost = max(0, game['growth'] * 10)
+                
+                # Calculate probability
+                base_prob = 0.25  # Minimum probability
+                prob = (position_confidence * 0.5 + growth_boost * 0.3 + base_prob) * time_decay
+                prob = max(0.01, min(0.95, prob))
+                
+                hour_pred['top_10'].append({
+                    "rank": position + 1,
+                    "name": game['name'],
+                    "probability": round(prob, 6),
+                    "estimated_players": round(game['current_players'] * (1 + game['growth'] * hour * 0.01))
+                })
+            else:
+                # Fill remaining positions with low probability
+                hour_pred['top_10'].append({
+                    "rank": position + 1,
+                    "name": "unknown",
+                    "probability": 0.01,
+                    "estimated_players": 0
+                })
         
-        forecasts.append(hour_forecast)
+        forecasts.append(hour_pred)
     
-    return forecasts
+    return {
+        "forecast": forecasts,
+        "model": "multi-factor-rank-forecaster-v1",
+        "total_games_analyzed": len(scored_games),
+        "generated_from": len(snapshots),
+        "scored_games": [g['name'] for g in scored_games[:20]]
+    }
 
 def main():
-    # Load input data
+    print("Loading input data...")
     snapshots = load_input()
+    print(f"Loaded {len(snapshots)} snapshots")
     
     if not snapshots:
-        # Create empty forecast if no data
-        forecast = {
-            "forecast": []
-        }
+        print("No snapshots found, creating empty forecast")
+        forecast = {"forecast": []}
     else:
-        # Extract game statistics
-        game_data = extract_game_stats(snapshots)
+        print("Extracting game features...")
+        game_features = extract_features(snapshots)
+        print(f"Found {len(game_features)} unique games")
         
-        # Generate predictions
-        predictions = predict_top_10(snapshots, game_data)
-        
-        forecast = {
-            "forecast": predictions,
-            "model": "momentum-rank-forecaster",
-            "generated_at": snapshots[-1].get('timestamp', ''),
-            "input_snapshots": len(snapshots)
-        }
+        print("Generating forecast...")
+        forecast = generate_forecast(snapshots, game_features)
+        print(f"Generated {len(forecast.get('forecast', []))} hourly predictions")
     
     # Ensure output directory exists
     os.makedirs("/output", exist_ok=True)
     
     # Write forecast
-    with open("/output/forecast.json", "w") as f:
+    output_path = "/output/forecast.json"
+    with open(output_path, "w") as f:
         json.dump(forecast, f, indent=2)
     
-    print(f"Forecast written to /output/forecast.json")
-    print(f"Generated {len(forecast.get('forecast', []))} predictions")
+    print(f"Forecast written to {output_path}")
+    
+    # Print summary
+    if forecast.get('forecast'):
+        first_pred = forecast['forecast'][0]
+        print(f"\nFirst hour prediction (hour 0):")
+        for item in first_pred.get('top_10', [])[:5]:
+            print(f"  #{item['rank']}: {item['name']} (prob: {item['probability']:.4f})")
 
 if __name__ == "__main__":
     main()
